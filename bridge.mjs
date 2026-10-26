@@ -1,5 +1,22 @@
 // bridge.mjs — chat.z.ai, STICKY SESSION + SUBAGENT ROUTE API
 // Node >= 22. 0 dependency.
+// [PATCH 2025-10-26 WEB MOI] 6 nhom sua:
+//  (1) HOOK TAT AGENT CHI O completions: features.flags=[] + preview_mode=false
+//      -> het MODEL_CONCURRENCY_LIMIT. chats/new GIU NGUYEN body site (v1 sua type/flags
+//      -> server 400, da REVERT).
+//  (2) Hook bump V5->V6 (tab mo san co hook cu khong chan hook moi).
+//  (3) openChat: nut Home/New chat = #sidebar-new-chat-button (bo qua text "new chat").
+//  (4) sendPrompt: nut gui = #send-message-button (bo btns.pop() click nham nut khac).
+//  (5) FAIL-FAST net-err: SSE co data.error.code hoac chats/new >=400 -> dung ngay,
+//      xoa session chat chet, bao loi ro cho DSH retry thay vi treo 600s.
+//  (6) stripSiteTools + <glm_block>; serverAnswer doc content array cua block text.
+//  (7) [v2.1] HOOK V6->V7: v1 va v2 cung dat flag __zaiHookV6 -> tab con hook v1 khong phat hien
+//      duoc (v1 van rewrite chats/new -> 400). V7 = flag rieng; thieu V7 -> F5 lay trang sach.
+//      + banner "=== BRIDGE v2.1-WEBMOI ===" luc khoi dong: khong thay dong nay = dang chay file cu.
+//  (8) [v2.2] TOC DO + GIO: doc answer TRUC TIEP tu SSE stream hook da bat (web xong -> co ngay,
+//      khoi cho poll server 20s); F5 giua chung CHI khi khong thay dang sinh (F5 vo dieu kien
+//      moi 30s cua ban cu giet stream -> mat answer -> nghen 30-60s); serverAnswer fallback
+//      20s->10s; F5-don-trang tu HUY neu request sau da den; log in gio LOCAL (ban cu UTC lech 7h).
 
 import { createServer } from "node:http";
 import { writeFileSync, readFileSync } from "node:fs";
@@ -21,7 +38,7 @@ const CHROME  = process.env.CHROME ?? "C:\\Program Files\\Google\\Chrome\\Applic
 const SEL_INPUT = "#chat-input";
 const API_COMPLETIONS = "/v2/chat/completions";
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const log   = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+const log   = (...a) => { const d = new Date(), p = n => String(n).padStart(2, "0"); console.log(p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()), ...a); };   // [v2.2] gio LOCAL may (ban cu in UTC -> lech 7h voi VN)
 const txt   = c => typeof c === "string" ? c : Array.isArray(c) ? c.map(x => x?.text ?? "").filter(Boolean).join("\n") : "";
 
 const MEM_RE   = /memory extraction subagent/i;
@@ -30,6 +47,8 @@ const API_KEY   = (process.env.ZAI_API_KEY ?? "").trim();
 const API_URL   = "https://api.z.ai/api/paas/v4/chat/completions";
 const API_MODEL   = process.env.ZAI_MEM_MODEL ?? "glm-4.7-flash";
 const FORCE_MODEL = process.env.ZAI_FORCE_MODEL ?? "glm-5.3";
+const BUILD = "v2.2-WEBMOI (2025-10-26)";   // [PATCH v2.1] banner khoi dong — in ra de xac nhan file nao dang chay
+let lastReqAt = 0;   // [v2.2] thoi diem request den — F5-don-trang check de khong reload dam vao request sau
 const isMem = msgs => { const u = msgs.find(m => m.role === "user"); return !!u && MEM_RE.test(txt(u.content)); };
 const WEBFETCH_RE = /^\s*(<[^>]+>\s*)*Web page content:/i;
 const isSub = msgs => {
@@ -137,7 +156,13 @@ const getSess = msgs => {
 };
 
 const HOOK = `(() => {
-  if (window.__zaiHooked && window.__zaiHookV5) return; window.__zaiHooked = true; window.__zaiHookV5 = true;
+  // [PATCH v2.1] bump V6 -> V7: v1 va v2 deu dat __zaiHookV6 -> khong phan biet duoc tab nao con hook v1
+  //   (hook v1 rewrite ca chats/new -> 400). V7 = flag RIENG cua ban v2.1 tro len.
+  //   Neu tab chi co hook v1 (V6) thi KHONG wrap chong len (v1 van nam duoi, van rewrite chats/new)
+   //  -> de nguyen, sendPrompt thay thieu V7 se F5 lay trang sach roi hook V7 chuoi.
+  if (window.__zaiHookV7) return;                         // ban nay da hook roi -> khong wrap lap
+  if (window.__zaiHooked && window.__zaiHookV6) return;   // con hook v1 trong tab -> khong chong, cho F5
+  window.__zaiHooked = true; window.__zaiHookV7 = true;
   window.__zaiLog = [];
   const mark = o => (window.__zaiLog.push(o), o);
   const FORCE_MODEL = ${JSON.stringify(FORCE_MODEL)};
@@ -163,6 +188,20 @@ const HOOK = `(() => {
       }
       if (bd.chat && bd.chat.reasoning_effort) bd.chat.reasoning_effort = "max";
       if (bd.features && bd.features.reasoning_effort) bd.features.reasoning_effort = "max";
+      // [PATCH v2 2025-10 WEB MOI] TAT AGENT CHI TANG /v2/chat/completions.
+      // Ban v1 sua ca chats/new (type=default + xoa flags + loc features) -> server tra 400 (log 12:33).
+      // => REVERT: chats/new GIU NGUYEN body site gui (chi FORCE_MODEL + reasoning max nhu ban goc,
+      //    cach nay chay 200 tu truoc). Chat tao bang type gi khong quan trong — hanh vi sinh do
+      //    completions quy dinh.
+      // => completions: features.flags=[] (tat agent pipeline + site-tool glm_block)
+      //    + preview_mode=false (roi khoi nhom x-preview-l gioi han -> het MODEL_CONCURRENCY_LIMIT).
+      //    Dung body nay da test console thay SSE 200.
+      try {
+        if (url.includes(${JSON.stringify(API_COMPLETIONS)}) && bd.features) {
+          if (Array.isArray(bd.features.flags)) bd.features.flags = [];
+          if ("preview_mode" in bd.features) bd.features.preview_mode = false;
+        }
+      } catch (e) {}
       return JSON.stringify(bd);
     } catch (e) { return body; }
   };
@@ -366,10 +405,11 @@ async function openChat(S) {
       } else {
         let veNha = true;
         if (/\/c\//.test(cur)) {
+          // [PATCH WEB MOI] nut "Home / New chat" co id cu the: #sidebar-new-chat-button.
+          // KHONG quet text "new chat" nua — de trung item lich su co ten "New Chat".
           const nc = await ev(`(() => {
-            const b = [...document.querySelectorAll('button, a, [role="button"], div')]
-              .find(e => e.offsetParent && /^new chat$/i.test((e.innerText || "").trim()));
-            if (b) {
+            const b = document.querySelector("#sidebar-new-chat-button");
+            if (b && b.offsetParent) {
               b.scrollIntoView({ block: "center" });
               b.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
               b.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
@@ -516,8 +556,8 @@ async function sendPrompt(text, S) {
     await send("Page.reload");
     if (await waitSel(SEL_INPUT, 30_000)) { await sleep(2500); await waitIdle(); }
   }
-  if (!(await ev("!!(window.__zaiLog && window.__zaiHookV5)").catch(() => false))) {
-    log("HOOK cu hoac mat -> reload trang inject lai");
+  if (!(await ev("!!(window.__zaiLog && window.__zaiHookV7)").catch(() => false))) {
+    log("HOOK v1/V6 cu hoac mat -> F5 lay trang sach + inject hook V7 (chi rewrite completions)");
     await ev("location.reload()");
     if (!(await waitSel(SEL_INPUT, 30_000))) throw new Error("khong thay o nhap sau reload hook");
     await sleep(2500);
@@ -576,10 +616,11 @@ async function sendPrompt(text, S) {
     for (let i = 0; i < 16; i++) { await sleep(250); if (await sentOk()) return { ok: true, len: len1 }; }
     log("Enter van chua gui -> click nut submit");
     await ev(`(() => {
-      const btns = [...document.querySelectorAll("form button")].filter(b => !b.disabled);
-      const b = btns.find(b => /send|submit|gui/i.test(b.getAttribute("aria-label") || ""))
-            || btns.find(b => b.type === "submit")
-            || btns.pop();
+      // [PATCH WEB MOI] nut gui that la #send-message-button (type=submit, disabled khi input rong).
+      // KHONG dung btns.pop() nua — form moi co them nut "Select a model"/"Connect IM" se bi click nham.
+      const b = document.querySelector("#send-message-button:not([disabled])")
+        || [...document.querySelectorAll("form button")].filter(x => !x.disabled)
+             .find(x => /send|submit|gui/i.test(x.getAttribute("aria-label") || "") || x.type === "submit");
       if (b) { b.dispatchEvent(new MouseEvent("mousedown",{bubbles:true})); b.dispatchEvent(new MouseEvent("mouseup",{bubbles:true})); b.click(); }
     })()`);
     for (let i = 0; i < 24; i++) { await sleep(250); if (await sentOk()) return { ok: true, len: len1 }; }
@@ -623,7 +664,9 @@ async function serverAnswer(chatId) {
         const blocks = m.content_blocks || [];
         return blocks
           .filter(b => b && b.type === "text")
-          .map(b => b.content || "")
+          .map(b => typeof b.content === "string" ? b.content
+            : Array.isArray(b.content) ? b.content.map(x => (x && x.text) || "").filter(Boolean).join("\\n")
+            : "")
           .join("");
       };
 
@@ -782,6 +825,9 @@ function pickChunk(j) {
 }
 const stripSiteTools = t => String(t || "")
   .replace(/<divinjeff>[\s\S]*?<\/divinjeff>/gi, "")
+  // [PATCH WEB MOI] site-tool moi danh dau bang <glm_block ...> (thay <divinjeff>)
+  .replace(/<glm_block[^>]*>[\s\S]*?<\/glm_block>/gi, "")
+  .replace(/<\/?glm_block[^>]*>/gi, "")
   .replace(/\n{3,}/g, "\n\n");
 
 const protoBlock = tools => {
@@ -1196,6 +1242,7 @@ createServer(async (req, res) => {
     if (prompt === null) return J(400, { error: { message: "khong co tin moi" } });
     if (!prompt.trim()) return J(400, { error: { message: "empty prompt" } });
 
+    lastReqAt = Date.now();   // [v2.2] ghi nhan request vua den (F5-don-trang se HUY neu chay dam vao luc nay)
     log("XEP HANG — cho request truoc xong");
     await mutex(async () => {
       let idx = 0;   // scope cho bestRec — ERR "idx is not defined" 08:05
@@ -1216,6 +1263,7 @@ createServer(async (req, res) => {
       res.write(`data: ${JSON.stringify({ ...head, choices: [{ index: 0, delta: { role: "assistant" } }] })}\n\n`);
 
       let ans = "", think = "", st = 0, ct = "", via = "?", full = "", types = {};
+      let sseFail = null;   // [PATCH v2] hoist RA KHOI vong for — bug v1 khai bao trong block for -> "sseFail is not defined" (log 12:33)
       const t0 = Date.now();
 
       for (let attempt = 0; attempt < 1; attempt++) {   // 1 request = 1 lan gui — doc hong thi bao loi, khong gui lai
@@ -1234,16 +1282,79 @@ createServer(async (req, res) => {
           await send("Input.dispatchKeyEvent", { type: "keyUp", ...k });
         };
         const inputLenL = () => ev(`(() => { const el = document.querySelector(${JSON.stringify(SEL_INPUT)}); return el ? (el.value || el.innerText || "").length : 0; })()`).catch(() => 0);
+        // [PATCH] FAIL-FAST NET-ERR: doc __zaiLog tu idx — SSE co data.error.code hoac POST
+        // chats/new tra >= 400 thi dung NGAY (web da xoa chat) thay vi treo den TIMEOUT 600s.
+        const netErr = () => ev(`(() => {
+          const L = window.__zaiLog || [];
+          for (let j = ${idx}; j < L.length; j++) {
+            const u = String(L[j].url || "");
+            if (/chats\\/new/.test(u) && L[j].status >= 400) return "CHATS_NEW_HTTP_" + L[j].status;
+            if (!/completion/i.test(u)) continue;
+            const raw = (L[j].chunks || []).join("");
+            const m = raw.match(/"error"\\s*:\\s*\\{[\\s\\S]{0,200}?"code"\\s*:\\s*"([^"]{3,60})"/);
+            if (m) return m[1];
+          }
+          return null;
+        })()`).catch(() => null);
+        // [v2.2] SSE FAST-PATH: doc answer TRUC TIEP tu stream ma hook da bat trong __zaiLog.
+        // Web sinh xong -> [DONE] xuat hien -> lay NGAY, khoi cho poll server 10-20s.
+        // Parse = dung chung logic script verify da chay that tren web moi:
+        // unwrap {type:"chat:completion",data:{...}}, chi lay phase==="answer".
+        const sseAns = () => ev(`(() => {
+          const L = window.__zaiLog || [];
+          for (let j = ${idx}; j < L.length; j++) {
+            const u = String(L[j].url || "");
+            if (!/completion/i.test(u)) continue;
+            const raw = (L[j].chunks || []).join("");
+            if (!raw.includes("[DONE]")) continue;   // stream chua xong / bi F5 giau mang -> bo qua
+            let out = "";
+            for (const ln of raw.split("\\n")) {
+              const s = ln.trim();
+              if (!s.startsWith("data:")) continue;
+              const p = s.slice(5).trim();
+              if (!p || p === "[DONE]") continue;
+              try {
+                const j2 = JSON.parse(p);
+                const d = (j2.type === "chat:completion" && j2.data) ? j2.data : (j2.data ?? j2);
+                if (d.phase === "answer" && typeof d.delta_content === "string") out += d.delta_content;
+              } catch (e) {}
+            }
+            if (out.trim()) return out;
+          }
+          return null;
+        })()`).catch(() => null);
+        let lastSrvAt = tLoop;
         while (Date.now() - tLoop < TIMEOUT) {
-          await sleep(20000);   // loi m: poll 20s/lan — 3s la spam z.ai
-          const cid = chatIdSrv0();
-          if (cid) {
-            const srv = await serverAnswer(cid);
-            if (srv.trim()) { serverAns = srv; log("[SERVER] answer ve sau F5 — " + srv.length + " ky tu"); break; }
+          await sleep(3000);   // [v2.2] 3s/lan — chi doc memory qua CDP (re, khong API z.ai); loi m "3s spam" la ve API call, khong phai doc memory
+          const ec = await netErr();
+          if (ec) {
+            sseFail = ec;
+            log("[NET-ERR] " + ec + " — fail nhanh thay vi cho " + Math.round(TIMEOUT / 1000) + "s");
+            if (/CONCURRENCY/i.test(ec) || /^CHATS_NEW_HTTP_/.test(ec)) {
+              S.chatUrl = null; S.booted = false;   // web da xoa chat / chat khong tao duoc — request sau bootstrap lai chat moi
+              try { saveSessions(); } catch (e) {}
+            }
+            break;
+          }
+          // [v2.2] FAST-PATH: web sinh xong ([DONE] trong stream) -> lay answer NGAY TAI DAY
+          const sse = await sseAns();
+          if (sse) { serverAns = sse; log("[SSE] answer truc tiep — " + sse.length + " ky tu | " + ((Date.now() - tLoop) / 1000).toFixed(1) + "s sau prompt"); break; }
+          if (Date.now() - lastSrvAt >= 10000) {   // [v2.2] 20s -> 10s — fallback khi SSE khong doc duoc (hook mat / F5 cu)
+            lastSrvAt = Date.now();
+            const cid = chatIdSrv0();
+            if (cid) {
+              const srv = await serverAnswer(cid);
+              if (srv.trim()) { serverAns = srv; log("[SERVER] answer (fallback poll) — " + srv.length + " ky tu | " + ((Date.now() - tLoop) / 1000).toFixed(1) + "s"); break; }
+            }
           }
           if (Date.now() - tLoop >= (f5Count + 1) * 30000) {
+            // [v2.2] F5 CO DIEU KIEN: chi reload khi KHONG thay dau hieu dang sinh
+            // (khong co rec completions nao tu luc gui + khong co nut Stop).
+            // Ban cu F5 vo dieu kien moi 30s -> giet stream SSE giua chung -> mat answer truc tiep.
+            const genAlive = await ev(`(() => { const L = window.__zaiLog || []; for (let j = ${idx}; j < L.length; j++) if (/completion/i.test(String(L[j].url || ""))) return true; return !!document.querySelector('[aria-label="Stop"]'); })()`).catch(() => false);
             f5Count++;
-            log("[F5] " + f5Count * 30 + "s sau prompt — cap nhat trang (vo dieu kien, loi m)");
+            if (genAlive) { log("[F5] HUY — web dang sinh (completions/Stop) — khong reload sua stream"); continue; }
+            log("[F5] " + f5Count * 30 + "s sau prompt, chua thay dau hieu sinh -> cap nhat trang");
             await send("Page.reload").catch(() => {});
             await sleep(4500);
             for (let i = 0; i < 30; i++) { if (await ev('!!document.querySelector("#chat-input")').catch(() => false)) break; await sleep(500); }
@@ -1258,7 +1369,7 @@ createServer(async (req, res) => {
         ans = serverAns;
         full = "";
       }   // dong vong for (attempt) — 1 request = 1 lan gui
-      await grabChatId(S, idx);
+      if (!sseFail) await grabChatId(S, idx);   // [PATCH] fail-fast thi bo qua — chat da chet / da clear session
 
    let ansSrc = ans.trim() ? "SSE" : "";
    const chatIdSrv = S.chatUrl ? (S.chatUrl.match(/\/c\/([0-9a-f-]{16,})/i)?.[1] || null) : null;
@@ -1291,7 +1402,13 @@ createServer(async (req, res) => {
         res.write(`data: ${JSON.stringify({ ...head, choices: [{ index: 0, delta: { content: msg.slice(i, i + 400) } }] })}\n\n`); };
 
       if (!ans.trim()) {
-        const hint = !st ? "khong bat duoc response"
+        if (sseFail) await sleep(15000);   // [PATCH v2] NET-ERR -> cham 15s truoc khi bao loi, chan DSH retry xoang vong home
+        const hint = sseFail
+          ? (/CONCURRENCY/i.test(sseFail) ? "z.ai MODEL_CONCURRENCY_LIMIT — slot model day. Agent/preview da tat o hook; DSH retry se tu tao chat moi"
+             : /^CHATS_NEW_HTTP_(401|403)$/.test(sseFail) ? sseFail + " — cookie het han, login lai trong Chrome cua bridge"
+             : /^CHATS_NEW_HTTP_/.test(sseFail) ? sseFail + " — POST chats/new bi server chan (da revert rewrite, body la goc cua site) — kiem login/cookie trong Chrome cua bridge"
+             : "z.ai SSE error: " + sseFail)
+          : !st ? "khong bat duoc response"
           : st === 401 || st === 403 ? "cookie het han — login lai"
           : st === 429 ? "rate-limit — cho vai phut"
           : /WORKSPACE_TOOL_INIT|INTERNAL_ERROR|Internal Server Error/i.test(full) ? "Z.ai 500 phia tren — thu lai"
@@ -1330,9 +1447,13 @@ createServer(async (req, res) => {
       }
       // DA CO NOI DUNG -> RELOAD NGAY (loi m): don webchat khoi vung kẹt, lan sau khong nghen
       if (ans.trim()) {
-        log("[F5-SAU-ANS] cho 10s roi don trang");
+        log("[F5-SAU-ANS] cho 10s roi don trang (tu huy neu request sau da den)");
         setTimeout(async () => {
           await sleep(10000);
+          // [v2.2] HUY reload neu request moi da den / web dang sinh — reload giua chung se
+          // giet stream cua request sau (DSH gui tool-result ngay lap tuc sau answer)
+          const busy = (Date.now() - lastReqAt) < 20000 || await ev(`(() => { const stop = !!document.querySelector('[aria-label="Stop"]'); const inp = document.querySelector(${JSON.stringify(SEL_INPUT)}); return stop || (inp && (inp.value || "")).length > 0; })()`).catch(() => false);
+          if (busy) { log("[F5-SAU-ANS] HUY — request moi dang chay, giu nguyen trang"); return; }
           send("Page.reload").catch(() => {});
         }, 0);
       }
@@ -1342,7 +1463,7 @@ createServer(async (req, res) => {
     log("ERR", e.message);
     if (!res.headersSent) J(502, { error: { message: String(e.message) } }); else res.end();
   }
-}).listen(PORT, "127.0.0.1", () => log(`http://127.0.0.1:${PORT}/api/paas/v4/chat/completions  tools=${TOOLS}`));
+}).listen(PORT, "127.0.0.1", () => { log(`=== BRIDGE ${BUILD} ===`); log(`http://127.0.0.1:${PORT}/api/paas/v4/chat/completions  tools=${TOOLS}`); });
 
 await launch();
 log("Chrome da mo. CHUA LOGIN -> login trong window DO.");
