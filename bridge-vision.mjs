@@ -1,10 +1,10 @@
-﻿// bridge-vision.mjs — chat.z.ai, STICKY SESSION + SUBAGENT ROUTE API
+// bridge-vision.mjs — chat.z.ai, STICKY SESSION + SUBAGENT ROUTE API
 // Node >= 22. 0 dependency.
 
 import { createServer } from "node:http";
 import { writeFileSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, globSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -17,10 +17,17 @@ const MAXCH   = 30000;   // o nhap web nhan du — khong cat nua
 const TIMEOUT = Number(process.env.ZAI_TIMEOUT ?? 600_000);
 const PROFILE = process.env.ZAI_PROFILE ? join(process.env.ZAI_PROFILE) : join(homedir(), ".qwen-vision-bridge");   // profile rieng vision
 const DUMP    = join(process.cwd(), "vision-last.txt");
-const CHROME  = process.env.CHROME ?? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const CHROME  = process.env.CHROME ?? (process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+  : process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  : findLinuxChrome());   // [FIX] linux/mac tu dong tim Chrome
+const ZAI_HEADLESS = (process.env.ZAI_HEADLESS ?? "") !== "";   // [FIX] chay headless cho server/linux
+const QWEN_UA  = process.env.ZAI_UA ?? "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
+const QWEN_COOKIES = (process.env.QWEN_COOKIES ?? "").trim();   // [FIX] bootstrap login: day raw header Cookie vao Chrome truoc khi mo trang
 
 const QWEN_URL = "https://chat.qwen.ai/";
 const SEL_TA   = "textarea";
+const SEL_INPUT = "textarea.message-input-textarea, #chat-input, textarea";   // [FIX] thieu dinh nghia + UI moi Qwen da bo id #chat-input
+const FORCE_MODEL = (process.env.ZAI_FORCE_MODEL ?? "").trim();                // [FIX] thieu dinh nghia (dung o /__model)
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log   = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const txt   = c => typeof c === "string" ? c : Array.isArray(c) ? c.map(x => x?.text ?? "").filter(Boolean).join("\n") : "";
@@ -138,11 +145,50 @@ const getSess = msgs => {
 };
 
 
+function findLinuxChrome() {   // [FIX] tim chrome tren linux (puppeteer/playwright/apt)
+  const cands = ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+    ...globSync(join(homedir(), ".cache/puppeteer/chrome/*/chrome-linux*/chrome")),
+    ...globSync(join(homedir(), ".cache/ms-playwright/chromium-*/chrome-linux*/chrome"))];
+  return cands.find(c => { try { return existsSync(c); } catch { return false; } }) || "chrome";
+}
+
 let ws, mid = 0; const pend = new Map();
+let cookieBootDone = false;
 const send = (method, params = {}) => new Promise((res, rej) => {
   const i = ++mid; pend.set(i, { res, rej });
   ws.send(JSON.stringify({ id: i, method, params }));
 });
+// ===== [FIX] HOOK NETWORK — ban goc dung __zaiLog/__zaiHookV5 (ham sentOk) nhung KHONG CO code inject =====
+// Wrap fetch trong page: log moi request (url/status/ct) + bat chunk SSE cua /chat/completions + danh sach model.
+const HOOK_SRC = `(() => {
+  if (window.__zaiHookV5) return;
+  window.__zaiLog = []; window.__zaiModels = [];
+  try {
+    const of = window.fetch;
+    window.fetch = async function (...a) {
+      const url = typeof a[0] === "string" ? a[0] : ((a[0] && a[0].url) || "");
+      const r = await of.apply(this, a);
+      try {
+        const u = String(url);
+        const rec = { url: u, status: r.status, ct: (r.headers && r.headers.get("content-type")) || "", chunks: [] };
+        window.__zaiLog.push(rec);
+        if (window.__zaiLog.length > 400) window.__zaiLog.splice(0, 150);
+        if (u.includes("/models/")) {
+          try { const c = r.clone(); const j = await c.json(); const arr = (j && (j.data || j)) || []; if (Array.isArray(arr)) for (const x of arr) { const id = x && (x.id || x.model || x.name); if (id) window.__zaiModels.push(String(id)); } } catch {}
+        }
+        if (u.includes("chat/completion") && r.body && r.body.getReader) {
+          try {
+            const c = r.clone(); const rd = c.body.getReader(); const dec = new TextDecoder();
+            (async () => { try { for (;;) { const { done, value } = await rd.read(); if (done) break; rec.chunks.push(dec.decode(value)); if (rec.chunks.length > 4000) break; } } catch {} })();
+          } catch {}
+        }
+      } catch {}
+      return r;
+    };
+  } catch {}
+  window.__zaiHookV5 = true;
+})()`;
+
 async function connect() {
   const list = await (await fetch(`http://127.0.0.1:${CDP}/json`)).json();
   const t = list.find(p => p.type === "page" && p.url.includes("qwen.ai")) ?? list.find(p => p.type === "page");
@@ -158,19 +204,35 @@ async function connect() {
     }
     if (m.id && pend.has(m.id)) { const { res, rej } = pend.get(m.id); pend.delete(m.id); m.error ? rej(new Error(m.error.message)) : res(m.result); }
   };
-  await send("Runtime.enable"); await send("Page.enable");
+  await send("Runtime.enable"); await send("Page.enable"); await send("Network.enable");
+  await send("Page.addScriptToEvaluateOnNewDocument", { source: HOOK_SRC }).catch(() => {});   // [FIX] hook moi lan tai trang
+  await ev(HOOK_SRC).catch(() => {});                                                          // [FIX] inj ca trang dang mo san
 }
 async function launch() {
   if (!existsSync(PROFILE)) mkdirSync(PROFILE, { recursive: true });
   try { await fetch(`http://127.0.0.1:${CDP}/json/version`); log("CDP song — attach"); }
   catch {
     log("mo Chrome...");
-    spawn(CHROME, [`--remote-debugging-port=${CDP}`, `--user-data-dir=${PROFILE}`,
-      "--disable-features=CalculateNativeWinOcclusion", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows", "--disable-background-timer-throttling", "--no-first-run", "--no-default-browser-check", QWEN_URL],
-      { detached: true, stdio: "ignore" }).unref();
+    const args = [`--remote-debugging-port=${CDP}`, `--user-data-dir=${PROFILE}`,
+      "--disable-features=CalculateNativeWinOcclusion", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows", "--disable-background-timer-throttling", "--no-first-run", "--no-default-browser-check"];
+    if (ZAI_HEADLESS) args.push("--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--window-size=1400,900", `--user-agent=${QWEN_UA}`);
+    const startUrl = (QWEN_COOKIES && !cookieBootDone) ? "about:blank" : QWEN_URL;   // co cookie -> mo blank truoc, inject roi moi sang Qwen
+    args.push(startUrl);
+    spawn(CHROME, args, { detached: true, stdio: "ignore" }).unref();
     for (let i = 0; i < 60; i++) { try { await fetch(`http://127.0.0.1:${CDP}/json/version`); break; } catch { await sleep(500); } }
   }
   await connect();
+  // [FIX] BOOTSTRAP LOGIN BANG COOKIE — QWEN_COOKIES = raw header Cookie cua chat.qwen.ai dang login
+  if (QWEN_COOKIES && !cookieBootDone) {
+    cookieBootDone = true;
+    let ok = 0;
+    for (const [name, value] of qwenJar) { try { if (await send("Network.setCookie", { name, value, domain: ".qwen.ai", path: "/" })) ok++; } catch {} }
+    log("COOKIE BOOT: " + ok + "/" + qwenJar.size + " cookie -> mo " + QWEN_URL);
+    await send("Page.navigate", { url: QWEN_URL }).catch(() => {});
+    for (let i = 0; i < 30; i++) { if (await ev("!!document.querySelector('textarea')").catch(() => false)) break; await sleep(1000); }
+    await sleep(2000);
+    await syncJarFromBrowser();   // WAF co the set lai cookie khi load — dong bo ve jar phia Node
+  }
 }
 async function ev(expression, retried = false) {
   let out;
@@ -203,8 +265,12 @@ async function ev(expression, retried = false) {
     try { ws.close(); } catch {}
     const { execSync } = await import("node:child_process");
     try {
-      const psKill = "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | Where-Object { $_.CommandLine -match 'remote-debugging-port=" + CDP + "' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
-      execSync("powershell -NoProfile -Command " + JSON.stringify(psKill), { stdio: "ignore" });
+      if (process.platform === "win32") {
+        const psKill = "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | Where-Object { $_.CommandLine -match 'remote-debugging-port=" + CDP + "' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+        execSync("powershell -NoProfile -Command " + JSON.stringify(psKill), { stdio: "ignore" });
+      } else {
+        execSync(`pkill -f "remote-debugging-port=${CDP}"`, { stdio: "ignore" });   // [FIX] linux/mac
+      }
     } catch {}
     await sleep(2000);
     try { await Promise.race([launch(), new Promise((_, rej) => setTimeout(() => rej(new Error("LAUNCH_TIMEOUT")), 45_000))]); }
@@ -227,6 +293,109 @@ const waitSel = async (sel, ms) => {
   for (let i = 0; i < ms / 300; i++) { if (await ev(`!!document.querySelector(${JSON.stringify(sel)})`)) return true; await sleep(300); }
   return false;
 };
+
+// ===== [FIX] QWEN REST API v2 — doc answer TRUC TIEP tu server (ban goc thieu ham serverAnswer hoan toan) =====
+// Reverse-engineer tu qwen-chat-fe 0.3.26:
+//   - access token: GET https://auth.qwen.ai/api/v2/auths/refresh (cookie refresh_token, KHONG co header Authorization)
+//   - doc chat:    GET https://chat.qwen.ai/api/v2/chats/{chat_id} -> data.chat.messages[].content_list[phase="answer"]
+//   - header bat buoc: version / source: web / x-request-id / timezone — thieu la "Invalid request header"
+const QWEN_API_BASE = "https://chat.qwen.ai/api/v2";
+const QWEN_AUTH_REFRESH = "https://auth.qwen.ai/api/v2/auths/refresh";
+const qwenJar = new Map();   // name -> value (cookie jar phia Node)
+if (QWEN_COOKIES) for (const p of QWEN_COOKIES.split(/;\s*/)) { const i = p.indexOf("="); if (i > 0) qwenJar.set(p.slice(0, i).trim(), p.slice(i + 1).trim()); }
+const jarHeader = () => [...qwenJar.entries()].map(([k, v]) => k + "=" + v).join("; ");
+function jarMerge(res) {
+  try {
+    const sc = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+    for (const line of sc) { const [pair] = line.split(";"); const i = pair.indexOf("="); if (i > 0) qwenJar.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim()); }
+  } catch {}
+}
+const rid = () => (globalThis.crypto && crypto.randomUUID) ? crypto.randomUUID() : ("r" + Math.random().toString(36).slice(2) + Date.now().toString(36));
+const tzHeader = () => new Date().toString().replace(/\s*\(.+\)$/, "");
+let QTOK = { v: "", exp: 0 };
+async function qwenToken() {
+  if (QTOK.v && Date.now() < QTOK.exp) return QTOK.v;
+  const r = await fetch(QWEN_AUTH_REFRESH, {
+    headers: {
+      "user-agent": QWEN_UA, "accept": "application/json", "content-type": "application/json",
+      "accept-language": "en-US,en;q=0.9", "referer": "https://chat.qwen.ai/", "origin": "https://chat.qwen.ai",
+      "version": "0.3.26", "source": "web", "x-request-id": rid(), "timezone": tzHeader(),
+      "x-request-origin": "https://chat.qwen.ai", "cookie": jarHeader(),
+    },
+  });
+  jarMerge(r);
+  const j = await r.json().catch(() => null);
+  const tok = j && j.data && j.data.access_token;
+  if (!tok) throw new Error("qwen refresh token FAIL: " + JSON.stringify(j).slice(0, 160));
+  let exp = Date.now() + 14 * 60 * 1000;
+  try { const p = JSON.parse(Buffer.from(tok.split(".")[1], "base64").toString("utf8")); if (p.exp) exp = p.exp * 1000 - 60_000; } catch {}
+  QTOK = { v: tok, exp };
+  log("QWEN access_token OK — han " + new Date(exp).toISOString().slice(11, 19));
+  return tok;
+}
+async function syncJarFromBrowser() {   // browser la chuan (WAF tu giai) — dong bo cookie ve phia Node
+  try {
+    const all = await send("Network.getAllCookies");
+    let n = 0;
+    for (const c of (all || [])) {
+      if (!/qwen\.ai$/i.test(c.domain || "")) continue;
+      qwenJar.set(c.name, c.value); n++;
+    }
+    if (n) log("JAR sync tu browser: " + n + " cookie");
+    return n;
+  } catch { return 0; }
+}
+async function qwenGet(path, retried = false) {
+  const tok = await qwenToken();
+  const r = await fetch(QWEN_API_BASE + path, {
+    headers: {
+      "user-agent": QWEN_UA, "accept": "application/json",
+      "referer": "https://chat.qwen.ai/", "origin": "https://chat.qwen.ai",
+      "version": "0.3.26", "source": "web", "x-request-id": rid(), "timezone": tzHeader(),
+      "authorization": "Bearer " + tok, "cookie": jarHeader(),
+    },
+  });
+  jarMerge(r);
+  if (!r.ok) {
+    if (!retried && (r.status === 401 || r.status === 403 || r.status === 419)) {   // cookie/token chet -> sync tu browser roi thu lai 1 lan
+      await syncJarFromBrowser();
+      QTOK = { v: "", exp: 0 };
+      return qwenGet(path, true);
+    }
+    throw new Error("qwen api " + path + " -> HTTP " + r.status);
+  }
+  return await r.json().catch(() => null);
+}
+const chatBase = new Map();   // chatId -> Set(messageId) da ton tai TRUOC khi gui prompt (phan biet answer moi/cu)
+async function markBaseline(cid) {
+  const j = await qwenGet("/chats/" + cid).catch(() => null);
+  const msgs = j && j.data && j.data.chat && j.data.chat.messages;
+  const s = new Set(Array.isArray(msgs) ? msgs.map(m => m && m.id).filter(Boolean) : []);
+  chatBase.set(cid, s);
+  return s.size;
+}
+function ansOfMsg(m) {
+  if (!m || m.role !== "assistant" || !m.done) return "";
+  const cl = Array.isArray(m.content_list) ? m.content_list : [];
+  let t = cl.filter(c => c && (!c.phase || c.phase === "answer") && typeof c.content === "string").map(c => c.content).join("").trim();
+  if (!t && typeof m.content === "string") t = m.content.trim();
+  return t;
+}
+async function serverAnswer(cid) {
+  try {
+    const j = await qwenGet("/chats/" + cid);
+    const d = j && j.data; if (!d) return "";
+    const msgs = d.chat && d.chat.messages; if (!Array.isArray(msgs)) return "";
+    const base = chatBase.get(cid);
+    const cur = d.currentId || null;
+    let target = null;
+    if (cur) { const m = msgs.find(x => x && x.id === cur); if (m && (!base || !base.has(m.id))) target = m; }
+    if (!target) { for (let i = msgs.length - 1; i >= 0; i--) { const m = msgs[i]; if (m && m.role === "assistant" && (!base || !base.has(m.id))) { target = m; break; } } }
+    if (!target) return "";
+    return ansOfMsg(target);
+  } catch (e) { log("serverAnswer loi:", String(e && e.message || e).slice(0, 120)); return ""; }
+}
+const recAt = i => ev(`(window.__zaiLog || [])[${Number(i) || 0}]`);   // [FIX] thieu dinh nghia (dung o /__raw)
 
 // ===== MAT NGUOI — du kien eyes-qwen (textarea / Stop / .chat-response-message) =====
 const domState = async () => ev(`(() => { const ta = document.querySelector('textarea'); const stop = !![...document.querySelectorAll('button')].find(b => b.offsetParent && /^stop$/i.test((b.getAttribute('aria-label') || b.innerText || '').trim())); return { inputLen: ta ? (ta.value || '').length : -1, stop }; })()`).catch(() => null);
@@ -301,7 +470,9 @@ async function uploadImagesViaCDP(paths) {
   let ok = 0;
   for (const item of paths) {
     try {
-      const before = await ev(`(() => [...document.querySelectorAll('img')].filter(i => /^blob:/.test(i.src || '')).length)()`).catch(() => 0);
+      const cntVis = () => ev(`(() => [...document.querySelectorAll('.vision-item-container, img.vision-item-image')].filter(x => x.offsetParent !== null).length)()`).catch(() => -1);   // [FIX] UI moi: thumbnail la .vision-item-image (OSS url), khong con img[blob:]
+      const before = await cntVis();
+      if (before < 0) log("WARN: khong do duoc so file da gan — van thu paste");
       const buf = readFileSync(item.src);
       if (buf.length > 4 * 1024 * 1024) log("WARN: anh " + (buf.length / 1048576).toFixed(1) + "MB lon — base64 injection co the cham/loi");
       const b64 = buf.toString("base64");
@@ -328,11 +499,19 @@ async function uploadImagesViaCDP(paths) {
       let landed = false;
       const t0 = Date.now();
       while (Date.now() - t0 < 25000) {
-        const n = await ev(`(() => [...document.querySelectorAll('img')].filter(i => /^blob:/.test(i.src || '')).length)()`).catch(() => before);
+        const n = await cntVis();
         if (n > before) { landed = true; break; }
         await sleep(700);
       }
-      if (landed) { ok++; log("UPLOAD paste OK: " + fname + " (" + (buf.length / 1024).toFixed(0) + "KB)"); }
+      if (landed) {   // cho OSS upload xong (src chuyen sang http...) — gui som se mat anh
+        const t1 = Date.now();
+        while (Date.now() - t1 < 20000) {
+          const up = await ev(`(() => { const im = [...document.querySelectorAll('img.vision-item-image')]; if (!im.length) return true; return im.every(i => String(i.src || '').startsWith('http')); })()`).catch(() => null);
+          if (up !== false) break;
+          await sleep(800);
+        }
+        ok++; log("UPLOAD paste OK: " + fname + " (" + (buf.length / 1024).toFixed(0) + "KB)");
+      }
       else log("UPLOAD paste KHONG thay thumbnail sau 25s: " + fname);
       await sleep(800);
     } catch (e) {
@@ -826,7 +1005,7 @@ createServer(async (req, res) => {
     const body = JSON.parse(await new Promise(r => { const c = []; req.on("data", d => c.push(d)); req.on("end", () => r(Buffer.concat(c).toString())); }) || "{}");
     const model = String(body.model ?? "glm-5.3");
     const msgs  = body.messages ?? [];
-    try { writeFileSync("D:\\Zai\\ZaiApi\\debug-body.json", JSON.stringify(body, null, 2)); } catch {}
+    try { writeFileSync(join(process.cwd(), "debug-body.json"), JSON.stringify(body, null, 2)); } catch {}   // [FIX] duong dan cung D:\ chi hop Windows
     try {
       const last = msgs[msgs.length - 1];
       if (last && Array.isArray(last.content)) {
@@ -881,6 +1060,10 @@ createServer(async (req, res) => {
       let idx = 0;   // scope cho bestRec — ERR "idx is not defined" 08:05
       log(">>> REQUEST MOI —", msgs.length, "tin | task:", (S.firstUser || "").slice(0, 60).replace(/\s+/g, " "));
       await openChat(S);
+      {   // [FIX] chup BASELINE so tin cu cua chat truoc khi gui — serverAnswer chi nhan answer MOI sinh sau diem nay
+        const cid0 = S.chatUrl ? (S.chatUrl.match(/\/c\/([0-9a-f-]{16,})/i) || [])[1] : null;
+        if (cid0) { const nb = await markBaseline(cid0).catch(() => -1); if (nb >= 0) log("BASELINE " + cid0.slice(0, 8) + " — " + nb + " tin cu"); }
+      }
       let promptNow = prompt;
       if (!S.chatUrl && S.sent > 0) {
         S.sent = 0; S.booted = false;
@@ -926,7 +1109,7 @@ createServer(async (req, res) => {
             log("[F5] " + f5Count * 30 + "s sau prompt — cap nhat trang (vo dieu kien, loi m)");
             await send("Page.reload").catch(() => {});
             await sleep(4500);
-            for (let i = 0; i < 30; i++) { if (await ev('!!document.querySelector("#chat-input")').catch(() => false)) break; await sleep(500); }
+            for (let i = 0; i < 30; i++) { if (await ev(`!!document.querySelector(${JSON.stringify(SEL_INPUT)})`).catch(() => false)) break; await sleep(500); }
             const inL = await inputLenL();
             if (inL > 0) {
               log("[GUI-LAI] input con " + inL + " ky tu -> Enter lai");
